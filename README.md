@@ -2,7 +2,27 @@
 
 [![Slack Chat](http://empireslacking.herokuapp.com/badge.svg)](https://empireslacking.herokuapp.com/)
 
-DeepState is a framework that provides C and C++ developers with a common interface to various symbolic execution and fuzzing engines. Users can write one test harness using a Google Test-like API, then execute it using multiple backends without having to learn the complexities of the underlying engines. It supports writing unit tests and API sequence tests, as well as automatic test generation. Read more about the goals and design of DeepState in our [paper](https://www.cefns.nau.edu/~adg326/bar18.pdf).
+DeepState is a framework that provides C and C++ developers with a common interface to various symbolic execution and fuzzing engines. Users can write one test harness using a Google Test-like API, then execute it using multiple backends without having to learn the complexities of the underlying engines. It supports writing unit tests and API sequence tests, as well as automatic test generation. Read more about the goals and design of DeepState in our [paper](https://agroce.github.io/bar18.pdf).
+
+The [2018 IEEE Cybersecurity Development Conference](https://secdev.ieee.org/2018/home) will include a full tutorial on effective use of DeepState.
+
+## Overview of Features
+
+* Tests look like Google Test, but can use symbolic execution/fuzzing to generate data (parameterized unit testing)
+  * Easier to learn than binary analysis tools/fuzzers, but provides similar functionality
+* Already supports Manticore, Angr, Dr. Fuzz; more back-ends likely in future
+  * Switch test generation tool without re-writing test harness
+    * Work around show-stopper bugs
+    * Find out which tool works best for your code under test
+    * Different tools find different bugs/vulnerabilities
+    * Fair way to benchmark/bakeoff tools
+* Supports API-sequence generation with extensions to Google Test interface
+  * Concise readable way (OneOf) to say "run one of these blocks of code"
+  * Same construct supports fixed value set non-determinism
+  * E.g., writing a POSIX file system tester is pleasant, not painful as in pure Google Test idioms
+* Provides high-level strategies for improving symbolic execution/fuzzing effectiveness
+  * Pumping (novel to DeepState) to pick concrete values when symbolic execution is too expensive
+  * Automatic decomposition of integer compares to guide coverage-driven fuzzers
 
 ## Supported Platforms
 
@@ -47,7 +67,7 @@ The `virtualenv`-enabled `$PATH` should now include two executables: `deepstate`
 You can check your build using the test binaries that were (by default) built and emitted to `deepstate/build/examples`. For example, to use angr to symbolically execute the `IntegerOverflow` test harness with 4 workers, saving generated test cases in a directory called `out`, you would invoke:
 
 ```shell
-$ deepstate-angr --num_workers 4 -output_test_dir out $DEEPSTATE/build/examples/IntegerOverflow
+$ deepstate-angr --num_workers 4 --output_test_dir out $DEEPSTATE/build/examples/IntegerOverflow
 ```
 
  The resulting `out` directory should look something like:
@@ -65,7 +85,7 @@ $ deepstate-angr --num_workers 4 -output_test_dir out $DEEPSTATE/build/examples/
 
 ## Usage
 
-DeepState consists of a static library, used to write test harnesses, and command-line _executors_ written in Python. At this time, the best documentation are the [examples](/examples) and our [paper](https://www.cefns.nau.edu/~adg326/bar18.pdf).
+DeepState consists of a static library, used to write test harnesses, and command-line _executors_ written in Python. At this time, the best documentation are the [examples](/examples) and our [paper](https://agroce.github.io/bar18.pdf).
 
 ## Contributing
 

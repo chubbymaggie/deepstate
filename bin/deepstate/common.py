@@ -118,8 +118,16 @@ class DeepState(object):
         help="Number of workers to spawn for testing and test generation.")
 
     parser.add_argument(
-        "--output_test_dir", type=str, required=False,
+        "--output_test_dir", default="out", type=str, required=False,
         help="Directory where tests will be saved.")
+
+    parser.add_argument(
+        "--take_over", action='store_true',
+        help="Explore the program starting at the `TakeOver` hook.")
+
+    parser.add_argument(
+        "--klee", action='store_true',
+        help="Expect the test binary to use the KLEE API and use `main()` as entry point.")
 
     parser.add_argument(
         "binary", type=str, help="Path to the test binary to run.")
@@ -137,7 +145,6 @@ class DeepState(object):
     """Read a NUL-terminated string from `ea`."""
     assert isinstance(ea, (int, long))
     chars = []
-    i = 0
     while True:
       b, ea = self.read_uint8_t(ea, concretize=concretize, constrain=constrain)
       if self.is_symbolic(b):

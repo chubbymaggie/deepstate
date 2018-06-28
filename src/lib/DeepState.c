@@ -31,6 +31,8 @@ DEFINE_uint(num_workers, 1,
 DEFINE_string(input_test_dir, "", "Directory of saved tests to run.");
 DEFINE_string(output_test_dir, "", "Directory where tests will be saved.");
 
+DEFINE_bool(take_over, false, "Replay test cases in take-over mode.");
+
 /* Pointer to the last registers DeepState_TestInfo data structure */
 struct DeepState_TestInfo *DeepState_LastTestInfo = NULL;
 
@@ -44,27 +46,69 @@ uint32_t DeepState_InputIndex = 0;
 /* Jump buffer for returning to `DeepState_Run`. */
 jmp_buf DeepState_ReturnToRun = {};
 
-static const char *DeepState_TestAbandoned = NULL;
-static int DeepState_TestFailed = 0;
+/* Information about the current test run, if any. */
+static struct DeepState_TestRunInfo *DeepState_CurrentTestRun = NULL;
+
+static void DeepState_SetTestPassed(void) {
+  DeepState_CurrentTestRun->result = DeepState_TestRunPass;
+}
+
+static void DeepState_SetTestFailed(void) {
+  DeepState_CurrentTestRun->result = DeepState_TestRunFail;
+}
+
+static void DeepState_SetTestAbandoned(const char *reason) {
+  DeepState_CurrentTestRun->result = DeepState_TestRunAbandon;
+  DeepState_CurrentTestRun->reason = reason;
+}
+
+void DeepState_AllocCurrentTestRun(void) {
+  int mem_prot = PROT_READ | PROT_WRITE;
+  int mem_vis = MAP_ANONYMOUS | MAP_SHARED;
+  void *shared_mem = mmap(NULL, sizeof(struct DeepState_TestRunInfo), mem_prot,
+                          mem_vis, 0, 0);
+
+  if (shared_mem == MAP_FAILED) {
+    DeepState_Log(DeepState_LogError, "Unable to map shared memory.");
+    exit(1);
+  }
+
+  DeepState_CurrentTestRun = (struct DeepState_TestRunInfo *) shared_mem;
+}
+
+static void DeepState_InitCurrentTestRun(struct DeepState_TestInfo *test) {
+  DeepState_CurrentTestRun->test = test;
+  DeepState_CurrentTestRun->result = DeepState_TestRunPass;
+  DeepState_CurrentTestRun->reason = NULL;
+}
 
 /* Abandon this test. We've hit some kind of internal problem. */
 DEEPSTATE_NORETURN
 void DeepState_Abandon(const char *reason) {
-  DeepState_Log(DeepState_LogFatal, reason);
-  DeepState_TestAbandoned = reason;
+  DeepState_Log(DeepState_LogError, reason);
+
+  DeepState_CurrentTestRun->result = DeepState_TestRunAbandon;
+  DeepState_CurrentTestRun->reason = reason;
+
   longjmp(DeepState_ReturnToRun, 1);
 }
 
 /* Mark this test as having crashed. */
 void DeepState_Crash(void) {
-  DeepState_TestFailed = 1;
+  DeepState_SetTestFailed();
 }
 
 /* Mark this test as failing. */
 DEEPSTATE_NORETURN
 void DeepState_Fail(void) {
-  DeepState_TestFailed = 1;
-  longjmp(DeepState_ReturnToRun, 1);
+  DeepState_SetTestFailed();
+
+  if (FLAGS_take_over) {
+    // We want to communicate the failure to a parent process, so exit.
+    exit(DeepState_TestRunFail);
+  } else {
+    longjmp(DeepState_ReturnToRun, 1);
+  }
 }
 
 /* Mark this test as passing. */
@@ -74,7 +118,7 @@ void DeepState_Pass(void) {
 }
 
 void DeepState_SoftFail(void) {
-  DeepState_TestFailed = 1;
+  DeepState_SetTestFailed();
 }
 
 /* Symbolize the data in the exclusive range `[begin, end)`. */
@@ -108,6 +152,9 @@ char *DeepState_CStr(size_t len) {
     DeepState_Abandon("Can't create an SIZE_MAX-length string.");
   }
   char *str = (char *) malloc(sizeof(char) * (len + 1));
+  if (NULL == str) {
+    DeepState_Abandon("Can't allocate memory.");
+  }
   if (len) {
     DeepState_SymbolizeData(str, &(str[len - 1]));
   }
@@ -231,8 +278,7 @@ int32_t DeepState_MaxInt(int32_t v) {
 void _DeepState_Assume(int expr, const char *expr_str, const char *file,
                        unsigned line) {
   if (!expr) {
-    DeepState_LogFormat(DeepState_LogFatal, "Assumption %s at %s(%u) failed",
-                        expr_str, file, line);
+    DeepState_Abandon("Assumption failed");
   }
 }
 
@@ -302,6 +348,8 @@ const struct DeepState_IndexEntry DeepState_API[] = {
 
 /* Set up DeepState. */
 void DeepState_Setup(void) {
+  DeepState_AllocCurrentTestRun();
+
   /* TODO(pag): Sort the test cases by file name and line number. */
 }
 
@@ -311,11 +359,10 @@ void DeepState_Teardown(void) {
 }
 
 /* Notify that we're about to begin a test. */
-void DeepState_Begin(struct DeepState_TestInfo *info) {
-  DeepState_TestFailed = 0;
-  DeepState_TestAbandoned = NULL;
+void DeepState_Begin(struct DeepState_TestInfo *test) {
+  DeepState_InitCurrentTestRun(test);
   DeepState_LogFormat(DeepState_LogInfo, "Running: %s from %s(%u)",
-                      info->test_name, info->file_name, info->line_number);
+                      test->test_name, test->file_name, test->line_number);
 }
 
 /* Save a failing test. */
@@ -323,9 +370,8 @@ void DeepState_Begin(struct DeepState_TestInfo *info) {
 /* Runs in a child process, under the control of Dr. Memory */
 void DrMemFuzzFunc(volatile uint8_t *buff, size_t size) {
   struct DeepState_TestInfo *test = DeepState_DrFuzzTest;
-  DeepState_TestFailed = 0;
   DeepState_InputIndex = 0;
-  DeepState_TestAbandoned = NULL;
+  DeepState_InitCurrentTestRun(test);
   DeepState_LogFormat(DeepState_LogInfo, "Running: %s from %s(%u)",
                       test->test_name, test->file_name, test->line_number);
 
@@ -353,7 +399,7 @@ void DrMemFuzzFunc(volatile uint8_t *buff, size_t size) {
   /* The test was abandoned. We may have gotten soft failures before
    * abandoning, so we prefer to catch those first. */
   } else if (DeepState_CatchAbandoned()) {
-    DeepState_LogFormat(DeepState_LogFatal, "Abandoned: %s", test->test_name);
+    DeepState_LogFormat(DeepState_LogError, "Abandoned: %s", test->test_name);
 
   /* The test passed. */
   } else {
@@ -362,6 +408,106 @@ void DrMemFuzzFunc(volatile uint8_t *buff, size_t size) {
       DeepState_SavePassingTest();
     }
   }
+}
+
+void DeepState_RunSavedTakeOverCases(jmp_buf env,
+                                     struct DeepState_TestInfo *test) {
+  int num_failed_tests = 0;
+  const char *test_case_dir = FLAGS_input_test_dir;
+
+  DIR *dir_fd = opendir(test_case_dir);
+  if (dir_fd == NULL) {
+    DeepState_LogFormat(DeepState_LogInfo,
+                        "Skipping test `%s`, no saved test cases",
+                        test->test_name);
+    return;
+  }
+
+  struct dirent *dp;
+
+  /* Read generated test cases and run a test for each file found. */
+  while ((dp = readdir(dir_fd)) != NULL) {
+    if (DeepState_IsTestCaseFile(dp->d_name)) {
+      DeepState_InitCurrentTestRun(test);
+
+      pid_t case_pid = fork();
+      if (!case_pid) {
+        DeepState_Begin(test);
+
+        size_t path_len = 2 + sizeof(char) * (strlen(test_case_dir) +
+                                              strlen(dp->d_name));
+        char *path = (char *) malloc(path_len);
+        if (path == NULL) {
+          DeepState_Abandon("Error allocating memory");
+        }
+        snprintf(path, path_len, "%s/%s", test_case_dir, dp->d_name);
+        DeepState_InitInputFromFile(path);
+        free(path);
+
+        longjmp(env, 1);
+      }
+
+      int wstatus;
+      waitpid(case_pid, &wstatus, 0);
+
+      /* If we exited normally, the status code tells us if the test passed. */
+      if (WIFEXITED(wstatus)) {
+        switch (DeepState_CurrentTestRun->result) {
+        case DeepState_TestRunPass:
+          DeepState_LogFormat(DeepState_LogInfo,
+                              "Passed: TakeOver test with data from `%s`",
+                              dp->d_name);
+          break;
+        case DeepState_TestRunFail:
+          DeepState_LogFormat(DeepState_LogError,
+                              "Failed: TakeOver test with data from `%s`",
+                              dp->d_name);
+          break;
+        case DeepState_TestRunCrash:
+          DeepState_LogFormat(DeepState_LogError,
+                              "Crashed: TakeOver test with data from `%s`",
+                              dp->d_name);
+          break;
+        case DeepState_TestRunAbandon:
+          DeepState_LogFormat(DeepState_LogError,
+                              "Abandoned: TakeOver test with data from `%s`",
+                              dp->d_name);
+          break;
+        default:  /* Should never happen */
+          DeepState_LogFormat(DeepState_LogError,
+                              "Error: Invalid test run result %d from `%s`",
+                              DeepState_CurrentTestRun->result, dp->d_name);
+        }
+      } else {
+        /* If here, we exited abnormally but didn't catch it in the signal
+         * handler, and thus the test failed due to a crash. */
+        DeepState_LogFormat(DeepState_LogError,
+                            "Crashed: TakeOver test with data from `%s`",
+                            dp->d_name);
+      }
+    }
+  }
+  closedir(dir_fd);
+}
+
+int DeepState_TakeOver(void) {
+  struct DeepState_TestInfo test = {
+    .prev = NULL,
+    .test_func = NULL,
+    .test_name = "__takeover_test",
+    .file_name = "__takeover_file",
+    .line_number = 0,
+  };
+
+  DeepState_AllocCurrentTestRun();
+
+  jmp_buf env;
+  if (!setjmp(env)) {
+    DeepState_RunSavedTakeOverCases(env, &test);
+    exit(0);
+  }
+
+  return 0;
 }
 
 /* Notify that we're about to begin a test while running under Dr. Fuzz. */
@@ -384,14 +530,14 @@ struct DeepState_TestInfo *DeepState_FirstTest(void) {
   return DeepState_LastTestInfo;
 }
 
-/* Returns 1 if a failure was caught, otherwise 0. */
-int DeepState_CatchFail(void) {
-  return DeepState_TestFailed;
+/* Returns `true` if a failure was caught for the current test case. */
+bool DeepState_CatchFail(void) {
+  return DeepState_CurrentTestRun->result == DeepState_TestRunFail;
 }
 
-/* Returns 1 if this test case was abandoned. */
-int DeepState_CatchAbandoned(void) {
-  return DeepState_TestAbandoned != NULL;
+/* Returns `true` if the current test case was abandoned. */
+bool DeepState_CatchAbandoned(void) {
+  return DeepState_CurrentTestRun->result == DeepState_TestRunAbandon;
 }
 
 /* Overwrite libc's abort. */

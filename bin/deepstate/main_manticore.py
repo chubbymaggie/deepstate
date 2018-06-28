@@ -21,17 +21,16 @@ import sys
 try:
   import manticore
 except Exception as e:
-  if "Z3NotFoundError" in repr(type(e)):  
+  if "Z3NotFoundError" in repr(type(e)):
     print "Manticore requires Z3 to be installed."
     sys.exit(255)
   else:
     raise
 import multiprocessing
 import traceback
-from .common import DeepState
+from .common import DeepState, TestInfo
 
 from manticore.core.state import TerminateState
-from manticore.utils.helpers import issymbolic
 
 
 L = logging.getLogger("deepstate.mcore")
@@ -51,7 +50,7 @@ class DeepManticore(DeepState):
     return self.state.context
 
   def is_symbolic(self, val):
-    return manticore.utils.helpers.issymbolic(val)
+    return manticore.issymbolic(val)
 
   def create_symbol(self, name, size_in_bits):
     return self.state.new_symbolic_value(size_in_bits, name)
@@ -246,6 +245,12 @@ def hook_Log(state, level, ea):
   DeepManticore(state).api_log(level, ea)
 
 
+def hook_TakeOver(state):
+  """Implements `DeepState_TakeOver`, returning 1 to indicate that it was
+  hooked for symbolic execution."""
+  return 1
+
+
 def hook(func):
   return lambda state: state.invoke_model(func)
 
@@ -303,7 +308,7 @@ def find_symbol_ea(m, name):
   return 0
 
 
-def do_run_test(state, apis, test):
+def do_run_test(state, apis, test, hook_test=False):
   """Run an individual test case."""
   state.cpu.PC = test.ea
   m = manticore.Manticore(state, sys.argv[1:])
@@ -332,19 +337,22 @@ def do_run_test(state, apis, test):
   m.add_hook(apis['ClearStream'], hook(hook_ClearStream))
   m.add_hook(apis['LogStream'], hook(hook_LogStream))
 
+  if hook_test:
+    m.add_hook(test.ea, hook(hook_TakeOver))
+
   m.subscribe('will_terminate_state', done_test)
   m.run()
 
 
-def run_test(state, apis, test):
+def run_test(state, apis, test, hook_test):
   try:
-    do_run_test(state, apis, test)
+    do_run_test(state, apis, test, hook_test)
   except:
     L.error("Uncaught exception: {}\n{}".format(
-        sys.exc_info()[0], traceback.format_exc()))
+      sys.exc_info()[0], traceback.format_exc()))
 
 
-def run_tests(args, state, apis):
+def run_tests(state, apis, hook_test_ea):
   """Run all of the test cases."""
   pool = multiprocessing.Pool(processes=max(1, args.num_workers))
   results = []
@@ -352,7 +360,7 @@ def run_tests(args, state, apis):
   tests = mc.find_test_cases()
 
   L.info("Running {} tests across {} workers".format(
-      len(tests), args.num_workers))
+    len(tests), args.num_workers))
 
   for test in tests:
     res = pool.apply_async(run_test, (state, apis, test))
@@ -364,26 +372,40 @@ def run_tests(args, state, apis):
   exit(0)
 
 
-def main():
-  args = DeepManticore.parse_args()
-
-  try:
-    m = manticore.Manticore(args.binary)
-  except Exception as e:
-    L.critical("Cannot create Manticore instance on binary {}: {}".format(
-        args.binary, e))
+def main_takeover(m, args, takeover_symbol):
+  takeover_ea = find_symbol_ea(m, takeover_symbol)
+  if not takeover_ea:
+    L.critical("Cannot find symbol `{}` in binary `{}`".format(
+      takeover_symbol,
+      args.binary))
     return 1
 
-  m.verbosity(1)
+  takeover_state = m._initial_state
 
-  # Hack to get around current broken _get_symbol_address
-  m._binary_type = 'not elf'
-  m._binary_obj = m._initial_state.platform.elf
+  mc = DeepManticore(takeover_state)
 
+  ea_of_api_table = find_symbol_ea(m, 'DeepState_API')
+  if not ea_of_api_table:
+    L.critical("Could not find API table in binary `{}`".format(args.binary))
+    return 1
+
+  apis = mc.read_api_table(ea_of_api_table)
+  del mc
+
+  fake_test = TestInfo(takeover_ea, '_takeover_test', '_takeover_file', 0)
+
+  hook_test = not args.klee
+  takeover_hook = lambda state: run_test(state, apis, fake_test, hook_test)
+  m.add_hook(takeover_ea, takeover_hook)
+
+  m.run()
+
+
+def main_unit_test(m, args):
   setup_ea = find_symbol_ea(m, 'DeepState_Setup')
   if not setup_ea:
     L.critical("Cannot find symbol `DeepState_Setup` in binary `{}`".format(
-        args.binary))
+      args.binary))
     return 1
 
   setup_state = m._initial_state
@@ -397,8 +419,33 @@ def main():
 
   apis = mc.read_api_table(ea_of_api_table)
   del mc
+
   m.add_hook(setup_ea, lambda state: run_tests(args, state, apis))
   m.run()
+
+
+def main():
+  args = DeepManticore.parse_args()
+
+  try:
+    m = manticore.Manticore(args.binary)
+  except Exception as e:
+    L.critical("Cannot create Manticore instance on binary {}: {}".format(
+      args.binary, e))
+    return 1
+
+  m.verbosity(1)
+
+  # Hack to get around current broken _get_symbol_address
+  m._binary_type = 'not elf'
+  m._binary_obj = m._initial_state.platform.elf
+
+  if args.take_over:
+    return main_takeover(m, args, 'DeepState_TakeOver')
+  elif args.klee:
+    return main_takeover(m, args, 'main')
+  else:
+    return main_unit_test(m, args)
 
 
 if "__main__" == __name__:

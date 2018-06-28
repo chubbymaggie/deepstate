@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -55,6 +56,8 @@ DEEPSTATE_BEGIN_EXTERN_C
 
 DECLARE_string(input_test_dir);
 DECLARE_string(output_test_dir);
+
+DECLARE_bool(take_over);
 
 enum {
   DeepState_InputSize = 8192
@@ -306,8 +309,16 @@ struct DeepState_TestInfo {
   unsigned line_number;
 };
 
+struct DeepState_TestRunInfo {
+  struct DeepState_TestInfo *test;
+  enum DeepState_TestRunResult result;
+  const char *reason;
+};
+
 /* Pointer to the last registered `TestInfo` structure. */
 extern struct DeepState_TestInfo *DeepState_LastTestInfo;
+
+extern int DeepState_TakeOver(void);
 
 /* Defines the entrypoint of a test case. This creates a data structure that
  * contains the information about the test, and then creates an initializer
@@ -347,11 +358,11 @@ extern void DeepState_Begin(struct DeepState_TestInfo *info);
 /* Return the first test case to run. */
 extern struct DeepState_TestInfo *DeepState_FirstTest(void);
 
-/* Returns 1 if a failure was caught, otherwise 0. */
-extern int DeepState_CatchFail(void);
+/* Returns `true` if a failure was caught for the current test case. */
+extern bool DeepState_CatchFail(void);
 
-/* Returns 1 if this test case was abandoned. */
-extern int DeepState_CatchAbandoned(void);
+/* Returns `true` if the current test case was abandoned. */
+extern bool DeepState_CatchAbandoned(void);
 
 /* Save a passing test to the output test directory. */
 extern void DeepState_SavePassingTest(void);
@@ -368,7 +379,7 @@ extern jmp_buf DeepState_ReturnToRun;
 /* Checks a filename to see if might be a saved test case.
  *
  * Valid saved test cases have the suffix `.pass` or `.fail`. */
-static bool IsTestCaseFile(const char *name) {
+static bool DeepState_IsTestCaseFile(const char *name) {
   const char *suffix = strchr(name, '.');
   if (suffix == NULL) {
     return false;
@@ -392,7 +403,7 @@ static bool IsTestCaseFile(const char *name) {
 
 /* Resets the global `DeepState_Input` buffer, then fills it with the
  * data found in the file `path`. */
-static void InitializeInputFromFile(const char *path) {
+static void DeepState_InitInputFromFile(const char *path) {
   struct stat stat_buf;
 
   FILE *fp = fopen(path, "r");
@@ -463,7 +474,7 @@ static void DeepState_RunTest(struct DeepState_TestInfo *test) {
     /* The test was abandoned. We may have gotten soft failures before
      * abandoning, so we prefer to catch those first. */
   } else if (DeepState_CatchAbandoned()) {
-    DeepState_LogFormat(DeepState_LogFatal, "Abandoned: %s", test->test_name);
+    DeepState_LogFormat(DeepState_LogError, "Abandoned: %s", test->test_name);
     exit(DeepState_TestRunAbandon);
 
     /* The test passed. */
@@ -500,8 +511,8 @@ DeepState_ForkAndRunTest(struct DeepState_TestInfo *test) {
 /* Run a single saved test case with input initialized from the file
  * `name` in directory `dir`. */
 static enum DeepState_TestRunResult
-DeepState_DoRunSavedTestCase(struct DeepState_TestInfo *test, const char *dir,
-                             const char *name) {
+DeepState_RunSavedTestCase(struct DeepState_TestInfo *test, const char *dir,
+                           const char *name) {
   size_t path_len = 2 + sizeof(char) * (strlen(dir) + strlen(name));
   char *path = (char *) malloc(path_len);
   if (path == NULL) {
@@ -509,7 +520,7 @@ DeepState_DoRunSavedTestCase(struct DeepState_TestInfo *test, const char *dir,
   }
   snprintf(path, path_len, "%s/%s", dir, name);
 
-  InitializeInputFromFile(path);
+  DeepState_InitInputFromFile(path);
 
   free(path);
 
@@ -530,6 +541,50 @@ DeepState_DoRunSavedTestCase(struct DeepState_TestInfo *test, const char *dir,
   return result;
 }
 
+/* Run a single test many times, initialized against each saved test case in
+ * `FLAGS_input_test_dir`. */
+static int DeepState_RunSavedCasesForTest(struct DeepState_TestInfo *test) {
+  int num_failed_tests = 0;
+  const char *test_file_name = basename((char *) test->file_name);
+
+  size_t test_case_dir_len = 3 + strlen(FLAGS_input_test_dir)
+    + strlen(test_file_name) + strlen(test->test_name);
+  char *test_case_dir = (char *) malloc(test_case_dir_len);
+  if (test_case_dir == NULL) {
+    DeepState_Abandon("Error allocating memory");
+  }
+  snprintf(test_case_dir, test_case_dir_len, "%s/%s/%s",
+           FLAGS_input_test_dir, test_file_name, test->test_name);
+
+  struct dirent *dp;
+  DIR *dir_fd;
+
+  dir_fd = opendir(test_case_dir);
+  if (dir_fd == NULL) {
+    DeepState_LogFormat(DeepState_LogInfo,
+                        "Skipping test `%s`, no saved test cases",
+                        test->test_name);
+    free(test_case_dir);
+    return 0;
+  }
+
+  /* Read generated test cases and run a test for each file found. */
+  while ((dp = readdir(dir_fd)) != NULL) {
+    if (DeepState_IsTestCaseFile(dp->d_name)) {
+      enum DeepState_TestRunResult result =
+        DeepState_RunSavedTestCase(test, test_case_dir, dp->d_name);
+
+      if (result != DeepState_TestRunPass) {
+        num_failed_tests++;
+      }
+    }
+  }
+  closedir(dir_fd);
+  free(test_case_dir);
+
+  return num_failed_tests;
+}
+
 /* Run tests with saved input from `FLAGS_input_test_dir`.
  *
  * For each test unit and case, see if there are input files in the
@@ -542,41 +597,7 @@ static int DeepState_RunSavedTestCases(void) {
   DeepState_Setup();
 
   for (test = DeepState_FirstTest(); test != NULL; test = test->prev) {
-    const char *test_file_name = basename((char *) test->file_name);
-
-    size_t test_case_dir_len = 3 + strlen(FLAGS_input_test_dir)
-                             + strlen(test_file_name) + strlen(test->test_name);
-    char *test_case_dir = (char *) malloc(test_case_dir_len);
-    if (test_case_dir == NULL) {
-      DeepState_Abandon("Error allocating memory");
-    }
-    snprintf(test_case_dir, test_case_dir_len, "%s/%s/%s",
-             FLAGS_input_test_dir, test_file_name, test->test_name);
-
-    struct dirent *dp;
-    DIR *dir_fd;
-
-    dir_fd = opendir(test_case_dir);
-    if (dir_fd == NULL) {
-      DeepState_LogFormat(DeepState_LogInfo,
-                          "Skipping test `%s`, no saved test cases",
-                          test->test_name);
-      continue;
-    }
-
-    /* Read generated test cases and run a test for each file found. */
-    while ((dp = readdir(dir_fd)) != NULL) {
-      if (IsTestCaseFile(dp->d_name)) {
-        enum DeepState_TestRunResult result =
-          DeepState_DoRunSavedTestCase(test, test_case_dir, dp->d_name);
-
-        if (result != DeepState_TestRunPass) {
-          num_failed_tests++;
-        }
-      }
-    }
-    closedir(dir_fd);
-    free(test_case_dir);
+    num_failed_tests += DeepState_RunSavedCasesForTest(test);
   }
 
   DeepState_Teardown();

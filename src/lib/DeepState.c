@@ -29,9 +29,22 @@ DEFINE_uint(num_workers, 1,
             "Number of workers to spawn for testing and test generation.");
 
 DEFINE_string(input_test_dir, "", "Directory of saved tests to run.");
+DEFINE_string(input_which_test, "", "Test to use with --input_test_file or --input_test_files_dir.");
+DEFINE_string(input_test_file, "", "Saved test to run.");
+DEFINE_string(input_test_files_dir, "", "Directory of saved test files to run (flat structure).");
 DEFINE_string(output_test_dir, "", "Directory where tests will be saved.");
 
 DEFINE_bool(take_over, false, "Replay test cases in take-over mode.");
+DEFINE_bool(abort_on_fail, false, "Abort on file replay failure (useful in file fuzzing).");
+DEFINE_bool(verbose_reads, false, "Report on bytes being read during execution of test.");
+
+DEFINE_int(log_level, 0, "Minimum level of logging to output.");
+
+/* Set to 1 by Manticore/Angr/etc. when we're running symbolically. */
+int DeepState_UsingSymExec = 0;
+
+/* Set to 1 when we're using libFuzzer. */
+int DeepState_UsingLibFuzzer = 0;
 
 /* Pointer to the last registers DeepState_TestInfo data structure */
 struct DeepState_TestInfo *DeepState_LastTestInfo = NULL;
@@ -136,6 +149,9 @@ void DeepState_SymbolizeData(void *begin, void *end) {
       if (DeepState_InputIndex >= DeepState_InputSize) {
         DeepState_Abandon("Read too many symbols");
       }
+      if (FLAGS_verbose_reads) {
+        printf("Reading byte at %u\n", DeepState_InputIndex);
+      }
       bytes[i] = DeepState_Input[DeepState_InputIndex++];
     }
   }
@@ -212,6 +228,9 @@ int DeepState_Bool(void) {
   if (DeepState_InputIndex >= DeepState_InputSize) {
     DeepState_Abandon("Read too many symbols");
   }
+  if (FLAGS_verbose_reads) {
+    printf("Reading byte as boolean at %u\n", DeepState_InputIndex);
+  }  
   return DeepState_Input[DeepState_InputIndex++] & 1;
 }
 
@@ -221,9 +240,18 @@ int DeepState_Bool(void) {
         DeepState_Abandon("Read too many symbols"); \
       } \
       type val = 0; \
+      if (FLAGS_verbose_reads) { \
+        printf("STARTING MULTI-BYTE READ\n"); \
+      } \
       _Pragma("unroll") \
       for (size_t i = 0; i < sizeof(type); ++i) { \
+        if (FLAGS_verbose_reads) { \
+          printf("Reading byte at %u\n", DeepState_InputIndex); \
+        } \
         val = (val << 8) | ((type) DeepState_Input[DeepState_InputIndex++]); \
+      } \
+      if (FLAGS_verbose_reads) { \
+        printf("FINISHED MULTI-BYTE READ\n"); \
       } \
       return val; \
     }
@@ -278,6 +306,9 @@ int32_t DeepState_MaxInt(int32_t v) {
 void _DeepState_Assume(int expr, const char *expr_str, const char *file,
                        unsigned line) {
   if (!expr) {
+    DeepState_LogFormat(DeepState_LogError,
+                        "%s(%u): Assumption %s failed",
+                        file, line, expr_str);    
     DeepState_Abandon("Assumption failed");
   }
 }
@@ -343,12 +374,20 @@ const struct DeepState_IndexEntry DeepState_API[] = {
   {"StreamFloat",     (void *) _DeepState_StreamFloat},
   {"StreamString",    (void *) _DeepState_StreamString},
 
+  {"UsingLibFuzzer", (void *) &DeepState_UsingLibFuzzer},
+  {"UsingSymExec", (void *) &DeepState_UsingSymExec},
+
   {NULL, NULL},
 };
 
 /* Set up DeepState. */
+DEEPSTATE_NOINLINE
 void DeepState_Setup(void) {
-  DeepState_AllocCurrentTestRun();
+  static int was_setup = 0;
+  if (!was_setup) {
+    DeepState_AllocCurrentTestRun();
+    was_setup = 1;
+  }
 
   /* TODO(pag): Sort the test cases by file name and line number. */
 }
@@ -540,6 +579,53 @@ bool DeepState_CatchAbandoned(void) {
   return DeepState_CurrentTestRun->result == DeepState_TestRunAbandon;
 }
 
+extern int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size) {
+  if (Size > sizeof(DeepState_Input)) {
+    return 0; // Just ignore any too-big inputs
+  }
+
+  DeepState_UsingLibFuzzer = 1;
+  
+  struct DeepState_TestInfo *test = NULL;
+
+  DeepState_InitOptions(0, "");  
+  //DeepState_Setup(); we want to do our own, simpler, memory management
+  void *mem = malloc(sizeof(struct DeepState_TestRunInfo));
+  DeepState_CurrentTestRun = (struct DeepState_TestRunInfo *) mem;
+
+  test = DeepState_FirstTest();
+  const char* which_test = getenv("LIBFUZZER_WHICH_TEST");
+  if (which_test != NULL) {
+    for (test = DeepState_FirstTest(); test != NULL; test = test->prev) {
+      if (strncmp(which_test, test->test_name, strnlen(which_test, 1024)) == 0) {
+	break;
+      }
+    }
+  }
+
+  memset((void *) DeepState_Input, 0, sizeof(DeepState_Input));
+  DeepState_InputIndex = 0;
+
+  memcpy((void *) DeepState_Input, (void *) Data, Size);
+
+  DeepState_Begin(test);
+
+  enum DeepState_TestRunResult result = DeepState_RunTestLLVM(test);
+
+  const char* abort_check = getenv("LIBFUZZER_ABORT_ON_FAIL");
+  if (abort_check != NULL) {
+    if ((result == DeepState_TestRunFail) || (result == DeepState_TestRunCrash)) {
+      abort();
+    }
+  }
+
+  DeepState_Teardown();
+  DeepState_CurrentTestRun = NULL;
+  free(mem);
+  
+  return 0;  // Non-zero return values are reserved for future use.
+}
+
 /* Overwrite libc's abort. */
 void abort(void) {
   DeepState_Fail();
@@ -556,6 +642,16 @@ void __assert_fail(const char * assertion, const char * file,
 void __stack_chk_fail(void) {
   DeepState_Log(DeepState_LogFatal, "Stack smash detected.");
   __builtin_unreachable();
+}
+
+__attribute__((weak))
+int main(int argc, char *argv[]) {
+  int ret = 0;
+  DeepState_Setup();
+  DeepState_InitOptions(argc, argv);
+  ret = DeepState_Run();
+  DeepState_Teardown();
+  return ret;
 }
 
 DEEPSTATE_END_EXTERN_C

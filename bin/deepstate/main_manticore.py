@@ -16,7 +16,6 @@
 import logging
 logging.basicConfig()
 
-import collections
 import sys
 try:
   import manticore
@@ -88,6 +87,10 @@ class DeepManticore(DeepState):
     self.state.cpu.write_int(ea, val, size=8)
     return ea + 1
 
+  def write_uint32_t(self, ea, val):
+    self.state.cpu.write_int(ea, val, size=32)
+    return ea + 4
+
   def concretize(self, val, constrain=False):
     if isinstance(val, (int, long)):
       return val
@@ -124,7 +127,7 @@ class DeepManticore(DeepState):
     assert 0 < max_num
     if isinstance(val, (int, long)):
       return [val]
-    return self.state.solver.eval_upto(val, max_num)
+    return self.state.solve_n(val, max_num)
 
   def add_constraint(self, expr):
     if self.is_symbolic(expr):
@@ -227,16 +230,16 @@ def hook_ConcretizeCStr(state, begin_ea):
   return DeepManticore(state).api_concretize_cstr(begin_ea)
 
 
-def hook_MinUInt(self, val):
+def hook_MinUInt(state, val):
   """Implements the `Deeptate_MinUInt` API function, which lets the
   programmer ask for the minimum satisfiable value of an unsigned integer."""
-  return DeepManticore(procedure=self).api_min_uint(val)
+  return DeepManticore(state).api_min_uint(val)
 
 
-def hook_MaxUInt(self, val):
+def hook_MaxUInt(state, val):
   """Implements the `Deeptate_MaxUInt` API function, which lets the
   programmer ask for the minimum satisfiable value of a signed integer."""
-  return DeepManticore(procedure=self).api_max_uint(val)
+  return DeepManticore(state).api_max_uint(val)
 
 
 def hook_Log(state, level, ea):
@@ -266,6 +269,17 @@ def _is_program_crash(reason):
   return 'Invalid memory access' in reason.message
 
 
+def _is_program_exit(reason):
+  """Using the `reason` for the termination of a Manticore `will_terminate_state`
+  event, decide if we want to treat the termination as a simple exit of the program
+  being analyzed."""
+
+  if not isinstance(reason, TerminateState):
+    return False
+
+  return 'Program finished with exit status' in reason.message
+
+
 def done_test(_, state, state_id, reason):
   """Called when a state is terminated."""
   mc = DeepManticore(state)
@@ -282,6 +296,11 @@ def done_test(_, state, state_id, reason):
 
       # Don't raise new `TerminateState` exception
       super(DeepManticore, mc).crash_test()
+    elif _is_program_exit(reason):
+      L.info("State {} terminated due to program exit: {}".format(
+        state_id, reason))
+      super(DeepManticore, mc).pass_test()
+      #super(DeepManticore, mc).abandon_test()      
     else:
       L.error("State {} terminated due to internal error: {}".format(state_id,
                                                                      reason))
@@ -344,7 +363,7 @@ def do_run_test(state, apis, test, hook_test=False):
   m.run()
 
 
-def run_test(state, apis, test, hook_test):
+def run_test(state, apis, test, hook_test=False):
   try:
     do_run_test(state, apis, test, hook_test)
   except:
@@ -352,7 +371,7 @@ def run_test(state, apis, test, hook_test):
       sys.exc_info()[0], traceback.format_exc()))
 
 
-def run_tests(state, apis, hook_test_ea):
+def run_tests(args, state, apis):
   """Run all of the test cases."""
   pool = multiprocessing.Pool(processes=max(1, args.num_workers))
   results = []
@@ -371,6 +390,18 @@ def run_tests(state, apis, hook_test_ea):
 
   exit(0)
 
+def get_base(m):
+  e_type = m.initial_state.platform.elf['e_type']
+  if e_type == 'ET_EXEC':
+    return 0x0
+  elif e_type == 'ET_DYN':
+    if m.initial_state.cpu.address_bit_size == 32:
+      return 0x56555000
+    else:
+      return 0x555555554000
+  else:
+    L.critical("Invalid binary type `{}`".format(e_type))
+    exit(1)
 
 def main_takeover(m, args, takeover_symbol):
   takeover_ea = find_symbol_ea(m, takeover_symbol)
@@ -389,7 +420,12 @@ def main_takeover(m, args, takeover_symbol):
     L.critical("Could not find API table in binary `{}`".format(args.binary))
     return 1
 
-  apis = mc.read_api_table(ea_of_api_table)
+  base = get_base(m)
+  apis = mc.read_api_table(ea_of_api_table, base)
+
+  # Tell the system that we're using symbolic execution.
+  mc.write_uint32_t(apis["UsingSymExec"], 1)
+  
   del mc
 
   fake_test = TestInfo(takeover_ea, '_takeover_test', '_takeover_file', 0)
@@ -417,7 +453,8 @@ def main_unit_test(m, args):
     L.critical("Could not find API table in binary `{}`".format(args.binary))
     return 1
 
-  apis = mc.read_api_table(ea_of_api_table)
+  base = get_base(m)
+  apis = mc.read_api_table(ea_of_api_table, base)
   del mc
 
   m.add_hook(setup_ea, lambda state: run_tests(args, state, apis))
@@ -434,7 +471,7 @@ def main():
       args.binary, e))
     return 1
 
-  m.verbosity(1)
+  m.verbosity(args.verbosity)
 
   # Hack to get around current broken _get_symbol_address
   m._binary_type = 'not elf'

@@ -163,8 +163,10 @@ class SymbolicLinearContainer {
     }
   }
 
-  DEEPSTATE_INLINE SymbolicLinearContainer(void)
-      : SymbolicLinearContainer(DeepState_SizeInRange(0, 32)) {}
+  DEEPSTATE_INLINE SymbolicLinearContainer(void) {
+    value.reserve(32);
+    value.resize(DeepState_SizeInRange(0, 32));  // Avoids symbolic `malloc`.
+  }
 
   DEEPSTATE_INLINE operator T (void) const {
     return value;
@@ -325,10 +327,16 @@ inline static void ForAll(Closure func) {
 
 template <typename... FuncTys>
 inline static void OneOf(FuncTys&&... funcs) {
+  if (FLAGS_verbose_reads) {
+    printf("STARTING OneOf CALL\n");
+  }
   std::function<void(void)> func_arr[sizeof...(FuncTys)] = {funcs...};
   unsigned index = DeepState_UIntInRange(
-      0U, static_cast<unsigned>(sizeof...(funcs)));
+      0U, static_cast<unsigned>(sizeof...(funcs))-1);
   func_arr[Pump(index, sizeof...(funcs))]();
+  if (FLAGS_verbose_reads) {  
+    printf("FINISHED OneOf CALL\n");
+  }
 }
 
 inline static char OneOf(const char *str) {
@@ -343,7 +351,7 @@ inline static const T &OneOf(const std::vector<T> &arr) {
   if (arr.empty()) {
     DeepState_Abandon("Empty vector passed to OneOf.");
   }
-  return arr[DeepState_IntInRange(0, arr.size - 1)];
+  return arr[DeepState_IntInRange(0, arr.size() - 1)];
 }
 
 

@@ -22,7 +22,7 @@ using namespace deepstate;
 DEEPSTATE_NOINLINE static unsigned segfault(unsigned x) {
   if (x == 0x1234) {  // Magic number for engine to discover
     unsigned *p = NULL;
-    *p = 0xdeadbeef;  // Trigger segfault here
+    *(p+1) = 0xdeadbeef;  // Trigger segfault here
   }
 
   return x;
@@ -34,9 +34,4 @@ TEST(Crash, SegFault) {
   segfault(x);
 
   ASSERT_EQ(x, x);
-}
-
-int main(int argc, char *argv[]) {
-  DeepState_InitOptions(argc, argv);
-  return DeepState_Run();
 }

@@ -52,9 +52,3 @@ TEST(PrimePolynomial, OnlyGeneratesPrimes_NoStreaming) {
   DeepState_Assert(poly != (y * z));
   DeepState_Assert(IsPrime(Pump(poly)));
 }
-
-
-int main(int argc, char *argv[]) {
-  DeepState_InitOptions(argc, argv);
-  return DeepState_Run();
-}

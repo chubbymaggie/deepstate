@@ -16,7 +16,6 @@ import logging
 logging.basicConfig()
 
 import argparse
-import collections
 import md5
 import os
 import struct
@@ -36,7 +35,8 @@ LOG_LEVEL_DEBUG = 0
 LOG_LEVEL_INFO = 1
 LOG_LEVEL_WARNING = 2
 LOG_LEVEL_ERROR = 3
-LOG_LEVEL_FATAL = 4
+LOG_LEVEL_EXTERNAL = 4
+LOG_LEVEL_FATAL = 5
 
 
 LOGGER = logging.getLogger("deepstate")
@@ -87,6 +87,9 @@ class DeepState(object):
   def write_uint8_t(self, ea, val):
     raise NotImplementedError("Must be implemented by engine.")
 
+  def write_uint32_t(self, ea, val):
+    raise NotImplementedError("Must be implemented by engine.")
+
   def concretize(self, val, constrain=False):
     raise NotImplementedError("Must be implemented by engine.")
 
@@ -128,6 +131,10 @@ class DeepState(object):
     parser.add_argument(
         "--klee", action='store_true',
         help="Expect the test binary to use the KLEE API and use `main()` as entry point.")
+
+    parser.add_argument(
+        "--verbosity", default=1, type=int,
+        help="Verbosity level.")
 
     parser.add_argument(
         "binary", type=str, help="Path to the test binary to run.")
@@ -206,16 +213,17 @@ class DeepState(object):
     tests.sort(key=lambda t: (t.file_name, t.line_number))
     return tests
 
-  def read_api_table(self, ea):
+  def read_api_table(self, ea, base = 0):
     """Reads in the API table."""
+    ea = ea + base
     apis = {}
     while True:
       api_name_ea, ea = self.read_uintptr_t(ea)
       api_ea, ea = self.read_uintptr_t(ea)
       if not api_name_ea or not api_ea:
         break
-      api_name, _ = self.read_c_string(api_name_ea)
-      apis[api_name] = api_ea
+      api_name, _ = self.read_c_string(api_name_ea + base)
+      apis[api_name] = api_ea + base
     self.context['apis'] = apis
     return apis
 
@@ -433,6 +441,8 @@ class DeepState(object):
       else:
         return
 
+    expr_ea = self.concretize(expr_ea, constrain=True)
+    file_ea = self.concretize(file_ea, constrain=True)    
     constraint = arg != 0
     if not self.add_constraint(constraint):
       expr, _ = self.read_c_string(expr_ea, concretize=False)
@@ -458,7 +468,7 @@ class DeepState(object):
 
     for i in xrange(end_ea - begin_ea):
       val, _ = self.read_uint8_t(begin_ea + i, concretize=True, constrain=True)
-      _ = self.write_uint8_t(begin_ea + i, val)
+      self.write_uint8_t(begin_ea + i, val)
 
     return begin_ea
 

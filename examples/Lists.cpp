@@ -30,8 +30,3 @@ TEST(Vector, DoubleReversal) {
         << "Double reverse of vectors must be equal.";
   });
 }
-
-int main(int argc, char *argv[]) {
-  DeepState_InitOptions(argc, argv);
-  DeepState_Run();
-}

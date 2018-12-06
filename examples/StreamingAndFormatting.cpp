@@ -40,7 +40,3 @@ TEST(Formatting, OverridePrintf) {
   printf("hello again!");
 }
 
-int main(int argc, char *argv[]) {
-  DeepState_InitOptions(argc, argv);
-  return DeepState_Run();
-}

@@ -53,6 +53,8 @@ static const char *DeepState_LogLevelStr(enum DeepState_LogLevel level) {
       return "WARNING";
     case DeepState_LogError:
       return "ERROR";
+    case DeepState_LogExternal:
+      return "EXTERNAL";
     case DeepState_LogFatal:
       return "FATAL";
     default:
@@ -64,11 +66,17 @@ enum {
   DeepState_LogBufSize = 4096
 };
 
+extern int DeepState_UsingLibFuzzer;
+
 char DeepState_LogBuf[DeepState_LogBufSize + 1] = {};
 
 /* Log a C string. */
 DEEPSTATE_NOINLINE
 void DeepState_Log(enum DeepState_LogLevel level, const char *str) {
+  if ((DeepState_UsingLibFuzzer && (level < DeepState_LogExternal)) ||
+      (level < FLAGS_log_level)) {
+    return;
+  }
   memset(DeepState_LogBuf, 0, DeepState_LogBufSize);
   snprintf(DeepState_LogBuf, DeepState_LogBufSize, "%s: %s\n",
            DeepState_LogLevelStr(level), str);
@@ -90,6 +98,20 @@ void DeepState_LogVFormat(enum DeepState_LogLevel level,
                           const char *format, va_list args) {
   struct DeepState_VarArgs va;
   va_copy(va.args, args);
+  if (DeepState_UsingLibFuzzer && (level < DeepState_LogExternal)) {
+    return;
+  }
+  DeepState_LogStream(level);
+  DeepState_StreamVFormat(level, format, va.args);
+  DeepState_LogStream(level);
+}
+
+/* Log some formatted output. */
+DEEPSTATE_NOINLINE
+void DeepState_LogVFormatLLVM(enum DeepState_LogLevel level,
+			      const char *format, va_list args) {
+  struct DeepState_VarArgs va;
+  va_copy(va.args, args);
   DeepState_LogStream(level);
   DeepState_StreamVFormat(level, format, va.args);
   DeepState_LogStream(level);
@@ -104,6 +126,12 @@ void DeepState_LogFormat(enum DeepState_LogLevel level,
   DeepState_LogVFormat(level, format, args);
   va_end(args);
 }
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wbuiltin-declaration-mismatch"
 
 /* Override libc! */
 DEEPSTATE_NOINLINE
@@ -149,11 +177,25 @@ int vfprintf(FILE *file, const char *format, va_list args) {
   } else if (stdout == file) {
     DeepState_LogVFormat(DeepState_LogInfo, format, args);
   } else {
-    DeepState_LogStream(DeepState_LogWarning);
-    DeepState_Log(DeepState_LogWarning,
-                  "vfprintf with non-stdout/stderr stream follows:");
-    DeepState_LogVFormat(DeepState_LogInfo, format, args);
+    DeepState_LogVFormat(DeepState_LogExternal, format, args);
   }
+  /*
+    Old code.  Now let's just log everything with odd dest as "external."
+
+    if (!DeepState_UsingLibFuzzer) {
+      if (strstr(format, "INFO:") != NULL) {
+	// Assume such a string to an nonstd target is libFuzzer
+	DeepState_LogVFormat(DeepState_LogExternal, format, args);
+      } else {
+	DeepState_LogStream(DeepState_LogWarning);
+	DeepState_Log(DeepState_LogWarning,
+		      "vfprintf with non-stdout/stderr stream follows:");
+	DeepState_LogVFormat(DeepState_LogInfo, format, args);
+      }
+    } else {
+      DeepState_LogVFormat(DeepState_LogExternal, format, args);      
+    }
+  */
   return 0;
 }
 
@@ -180,5 +222,8 @@ int __vfprintf_chk(int flag, FILE *file, const char *format, va_list args) {
   vfprintf(file, format, args);
   return 0;
 }
+
+#pragma clang diagnostic pop
+#pragma GCC diagnostic pop
 
 DEEPSTATE_END_EXTERN_C
